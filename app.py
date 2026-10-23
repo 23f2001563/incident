@@ -9,7 +9,8 @@ app = FastAPI(redirect_slashes=False)  # never redirect grader requests
 
 PROFILE = "ga5-incident-agent/v2"
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "")  # optional: e.g. minimal / low (leave empty if unsure)
 PLAN_BUDGET = float(os.environ.get("PLAN_BUDGET", "15"))  # seconds for the whole planning step (limit per request is 18)
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 DB_PATH = os.environ.get("DB_PATH", "state.db")
@@ -150,20 +151,25 @@ Rules:
 - Evidence ID lists must contain only IDs that appear at the start of transcript lines, with no duplicates."""
 
 
+def call_model(model, parts, timeout, thinking=""):
+    cfg = {"responseMimeType": "application/json", "temperature": 0}
+    if thinking:
+        cfg["thinkingConfig"] = {"thinkingLevel": thinking}
+    return requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        params={"key": GEMINI_KEY}, json={"contents": [{"parts": parts}], "generationConfig": cfg}, timeout=max(timeout, 1))
+
+
 def gemini_json(parts, deadline):
     errors = []
-    for model in [GEMINI_MODEL, "gemini-flash-latest"]:
+    for model in [GEMINI_MODEL, "gemini-flash-lite-latest"]:
         remaining = deadline - time.time()
         if remaining < 4:
             break
         try:
-            r = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                params={"key": GEMINI_KEY},
-                json={"contents": [{"parts": parts}],
-                      "generationConfig": {"responseMimeType": "application/json", "temperature": 0}},
-                timeout=remaining - 1,
-            )
+            r = call_model(model, parts, remaining - 1, GEMINI_THINKING)
+            if r.status_code == 400 and GEMINI_THINKING:
+                r = call_model(model, parts, deadline - time.time() - 1, "")  # thinking option not accepted: retry without it
             if r.status_code != 200:
                 errors.append(f"{model} HTTP {r.status_code}")
                 continue
@@ -634,6 +640,30 @@ def selftest():
         out["gemini"] = "ERROR: " + str(e)[:500]
     out["gemini_seconds"] = round(time.time() - t, 1)
     return out
+
+
+@app.get("/selftest/models")
+def selftest_models():
+    """Times several candidate models in parallel (about 15 seconds), so you can pick the fastest working one."""
+    from concurrent.futures import ThreadPoolExecutor
+    cands = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-flash-lite-latest",
+             "gemini-3.5-flash", "gemini-3.8-flash", "gemini-flash-latest"]
+    jobs = [(m, th) for m in cands for th in ("", "low")]
+    parts = [{"text": 'Return only this JSON: {"ok": true, "n": 17}'}]
+
+    def one(job):
+        m, th = job
+        t = time.time()
+        try:
+            r = call_model(m, parts, 14, th)
+            res = f"HTTP {r.status_code}" + ("" if r.status_code == 200 else ": " + r.text[:80].replace("\n", " "))
+        except Exception as e:
+            res = "timeout/error: " + str(e)[:60]
+        return {"model": m, "thinkingLevel": th or "(default)", "seconds": round(time.time() - t, 1), "result": res}
+
+    with ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+        out = list(ex.map(one, jobs))
+    return sorted(out, key=lambda x: (not x["result"] == "HTTP 200", x["seconds"]))
 
 
 @app.get("/debug/errors")
